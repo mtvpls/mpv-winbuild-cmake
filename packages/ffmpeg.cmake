@@ -25,12 +25,10 @@ ExternalProject_Add(ffmpeg
         libopenmpt
         libjxl
         libplacebo
-        libzvbi
         libaribcaption
         dav1d
         vapoursynth
         ${ffmpeg_uavs3d}
-        ${ffmpeg_davs2}
         rubberband
         libva
         openal-soft
@@ -68,7 +66,6 @@ ExternalProject_Add(ffmpeg
         --enable-libvorbis
         --enable-librubberband
         --enable-libdav1d
-        ${ffmpeg_davs2_cmd}
         ${ffmpeg_uavs3d_cmd}
         --enable-libzimg
         --enable-openssl
@@ -77,7 +74,6 @@ ExternalProject_Add(ffmpeg
         --enable-libsrt
         --enable-libjxl
         --enable-libplacebo
-        --enable-libzvbi
         --enable-libaribcaption
         --enable-cuda-llvm
         --enable-cuvid
