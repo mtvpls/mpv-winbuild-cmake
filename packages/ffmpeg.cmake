@@ -4,7 +4,6 @@ ExternalProject_Add(ffmpeg
         avisynth-headers
         nvcodec-headers
         bzip2
-        lame
         lcms2
         openssl
         libssh
@@ -16,26 +15,18 @@ ExternalProject_Add(ffmpeg
         libmodplug
         libpng
         libsoxr
-        libbs2b
-        libvpx
-        libwebp
         libzimg
-        libmysofa
         fontconfig
         harfbuzz
         opus
         speex
         vorbis
-        x264
-        ${ffmpeg_x265}
         libxml2
         libopenmpt
         libjxl
         libplacebo
         libzvbi
         libaribcaption
-        aom
-        svtav1
         dav1d
         vapoursynth
         ${ffmpeg_uavs3d}
@@ -70,27 +61,18 @@ ExternalProject_Add(ffmpeg
         --enable-libharfbuzz
         --enable-libmodplug
         --enable-libopenmpt
-        --enable-libmp3lame
         --enable-lcms2
         --enable-libopus
         --enable-libsoxr
         --enable-libspeex
         --enable-libvorbis
-        --enable-libbs2b
         --enable-librubberband
-        --enable-libvpx
-        --enable-libwebp
-        --enable-libx264
-        --enable-libx265
-        --enable-libaom
-        --enable-libsvtav1
         --enable-libdav1d
         ${ffmpeg_davs2_cmd}
         ${ffmpeg_uavs3d_cmd}
         --enable-libzimg
         --enable-openssl
         --enable-libxml2
-        --enable-libmysofa
         --enable-libssh
         --enable-libsrt
         --enable-libjxl
@@ -110,7 +92,6 @@ ExternalProject_Add(ffmpeg
         --enable-vaapi
         --disable-vdpau
         --disable-videotoolbox
-        --disable-decoder=libaom_av1
         ${ffmpeg_lto}
         --extra-cflags='-Wno-error=int-conversion'
         "--extra-libs='${ffmpeg_extra_libs}'" # -lstdc++ / -lc++ needs by libjxl and shaderc
