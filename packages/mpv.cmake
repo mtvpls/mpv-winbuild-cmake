@@ -22,9 +22,7 @@ ExternalProject_Add(mpv
         spirv-cross
         vapoursynth
         libsdl2
-        subrandr
         libsixel
-        curl
     GIT_TAG v0.41.0
     PATCH_COMMAND ${EXEC} git apply ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch
     GIT_REPOSITORY https://github.com/mpv-player/mpv.git
