@@ -1,0 +1,234 @@
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+index 7013dbd..60ffdd3 100644
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -77,6 +77,7 @@ struct demux_lavf_opts {
+     char *sub_cp;
+     int rtsp_transport;
+     int linearize_ts;
++    bool drop_ts_rollbacks;
+     bool propagate_opts;
+ };
+ 
+@@ -106,6 +107,8 @@ const struct m_sub_options demux_lavf_conf = {
+             {"udp_multicast", 4})},
+         {"demuxer-lavf-linearize-timestamps", OPT_CHOICE(linearize_ts,
+             {"no", 0}, {"auto", -1}, {"yes", 1})},
++        {"demuxer-lavf-drop-timestamp-rollbacks",
++            OPT_BOOL(drop_ts_rollbacks)},
+         {"demuxer-lavf-propagate-opts", OPT_BOOL(propagate_opts)},
+         {0}
+     },
+@@ -220,6 +223,9 @@ struct stream_info {
+     double last_key_pts;
+     double highest_pts;
+     double ts_offset;
++    double rollback_highest_pts;
++    bool rollback_rolled_back;
++    bool rollback_recovered;
+ };
+ 
+ typedef struct lavf_priv {
+@@ -246,6 +252,16 @@ typedef struct lavf_priv {
+     int linearize_ts;
+     bool any_ts_fixed;
+ 
++    // See demuxer-lavf-drop-timestamp-rollbacks. Per-stream watermarks live in
++    // struct stream_info; entering and leaving a drop session is global so all
++    // tracks are cut at the same point on the timeline.
++    bool rollback_dropping;
++    double rollback_floor_pts;
++    double rollback_alt_start_pts;
++    int rollback_num_rolled_back;
++    bool rollback_need_keyframe;
++    int rollback_seek_grace;
++
+     int retry_counter;
+ 
+     AVDictionary *av_opts;
+@@ -813,6 +829,7 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
+         .sh = sh,
+         .last_key_pts = MP_NOPTS_VALUE,
+         .highest_pts = MP_NOPTS_VALUE,
++        .rollback_highest_pts = MP_NOPTS_VALUE,
+     };
+     mp_assert(priv->num_streams == i); // directly mapped
+     MP_TARRAY_APPEND(priv, priv->streams, priv->num_streams, info);
+@@ -1211,6 +1228,152 @@ fail:
+     return -1;
+ }
+ 
++// A stream must fall this far behind its own watermark before we treat it as a
++// different (ad) timeline. 8s sits too close to MPEG-TS reorder distance and
++// A/V skew, and fires several seconds before the ad actually starts.
++#define ROLLBACK_ENTER_SEC 20.0
++// Keyframe/preroll overlap tolerated when the original timeline returns.
++#define ROLLBACK_RECOVER_SEC 1.0
++// libavformat can still hand over a few pre-seek packets after a seek.
++#define ROLLBACK_SEEK_GRACE_PACKETS 100
++// One full 33-bit MPEG-TS timestamp period, in seconds (~26.5h).
++#define TS_WRAP_SEC (8589934592.0 / 90000.0)
++// Past this much of the foreign timeline it is not an ad break any more, it is
++// a real timeline change, and dropping forever would hang playback for good.
++#define ROLLBACK_GIVEUP_SEC 300.0
++
++// libavformat's MPEG-TS wraparound correction assumes timestamps only ever move
++// forward, so an ad segment whose own PTS starts near zero is handed to us one
++// whole period *ahead* of the content instead of behind it. Fold it back down,
++// otherwise the rollback reads as a jump forward and the ad's timeline gets
++// adopted as the reference — which then drops the returning content instead.
++static double ts_rollback_unwrap(double pts)
++{
++    while (pts >= TS_WRAP_SEC / 2)
++        pts -= TS_WRAP_SEC;
++    return pts;
++}
++
++static void reset_ts_rollback_state(lavf_priv_t *priv)
++{
++    for (int n = 0; n < priv->num_streams; n++) {
++        struct stream_info *info = priv->streams[n];
++        info->rollback_highest_pts = MP_NOPTS_VALUE;
++        info->rollback_rolled_back = false;
++        info->rollback_recovered = false;
++    }
++    priv->rollback_dropping = false;
++    priv->rollback_floor_pts = MP_NOPTS_VALUE;
++    priv->rollback_alt_start_pts = MP_NOPTS_VALUE;
++    priv->rollback_num_rolled_back = 0;
++    priv->rollback_need_keyframe = false;
++    priv->rollback_seek_grace = ROLLBACK_SEEK_GRACE_PACKETS;
++}
++
++static void ts_rollback_mark(lavf_priv_t *priv, struct stream_info *info)
++{
++    if (!info->rollback_rolled_back) {
++        info->rollback_rolled_back = true;
++        priv->rollback_num_rolled_back += 1;
++    }
++    info->rollback_recovered = false;
++}
++
++// True when the packet belongs to an old timeline (an inserted ad) and has to
++// be withheld from the demux queue.
++static bool ts_rollback_should_drop(struct demuxer *demux,
++                                    struct stream_info *info,
++                                    double pts, bool keyframe)
++{
++    lavf_priv_t *priv = demux->priv;
++
++    if (pts == MP_NOPTS_VALUE)
++        return priv->rollback_dropping || priv->rollback_need_keyframe;
++
++    pts = ts_rollback_unwrap(pts);
++
++    // A seek always clears the state, so no drop session can be active here.
++    if (priv->rollback_seek_grace > 0) {
++        priv->rollback_seek_grace -= 1;
++        info->rollback_highest_pts =
++            MP_PTS_MAX(info->rollback_highest_pts, pts);
++        return false;
++    }
++
++    if (priv->rollback_dropping) {
++        if (pts + ROLLBACK_RECOVER_SEC < priv->rollback_floor_pts) {
++            if (priv->rollback_alt_start_pts == MP_NOPTS_VALUE)
++                priv->rollback_alt_start_pts = pts;
++            if (pts > priv->rollback_alt_start_pts + ROLLBACK_GIVEUP_SEC) {
++                MP_WARN(demux, "Timestamp rollback ran for %f s, giving up and "
++                        "adopting the new timeline\n",
++                        pts - priv->rollback_alt_start_pts);
++                reset_ts_rollback_state(priv);
++                priv->rollback_seek_grace = 0;
++                priv->rollback_need_keyframe = true;
++                return true;
++            }
++            ts_rollback_mark(priv, info);
++            return true;
++        }
++
++        if (info->rollback_rolled_back) {
++            // Restarting mid-GOP leaves the decoder error-concealing a broken
++            // reference chain, so wait for a keyframe before reopening.
++            if (!keyframe)
++                return true;
++            info->rollback_rolled_back = false;
++            info->rollback_recovered = true;
++            priv->rollback_num_rolled_back -= 1;
++            info->rollback_highest_pts =
++                MP_PTS_MAX(info->rollback_highest_pts, pts);
++            if (priv->rollback_num_rolled_back == 0) {
++                MP_WARN(demux, "Timestamp rollback recovered: %f >= %f\n",
++                        pts, priv->rollback_floor_pts);
++                priv->rollback_dropping = false;
++                priv->rollback_floor_pts = MP_NOPTS_VALUE;
++                priv->rollback_alt_start_pts = MP_NOPTS_VALUE;
++                priv->rollback_need_keyframe = false;
++                for (int n = 0; n < priv->num_streams; n++)
++                    priv->streams[n]->rollback_recovered = false;
++            }
++            return false;
++        }
++
++        if (info->rollback_recovered) {
++            // Already restarted: keep feeding this track so the decoder is not
++            // starved while sibling tracks are still catching up.
++            info->rollback_highest_pts =
++                MP_PTS_MAX(info->rollback_highest_pts, pts);
++            return false;
++        }
++
++        // Never rolled back this session, typically continuous ad audio.
++        return true;
++    }
++
++    if (priv->rollback_need_keyframe) {
++        if (!keyframe)
++            return true;
++        priv->rollback_need_keyframe = false;
++    } else if (info->rollback_highest_pts != MP_NOPTS_VALUE &&
++               pts + ROLLBACK_ENTER_SEC < info->rollback_highest_pts)
++    {
++        // Compare against this stream's own watermark only. A watermark shared
++        // across streams false-fires when video readahead runs ahead of audio.
++        MP_WARN(demux, "Dropping timestamp rollback: %f -> %f\n",
++                info->rollback_highest_pts, pts);
++        priv->rollback_dropping = true;
++        priv->rollback_floor_pts = info->rollback_highest_pts;
++        priv->rollback_need_keyframe = true;
++        ts_rollback_mark(priv, info);
++        return true;
++    }
++
++    info->rollback_highest_pts = MP_PTS_MAX(info->rollback_highest_pts, pts);
++    return false;
++}
++
+ static bool demux_lavf_read_packet(struct demuxer *demux,
+                                    struct demux_packet **mp_pkt)
+ {
+@@ -1299,6 +1462,15 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
+         }
+     }
+ 
++    if (priv->opts->drop_ts_rollbacks) {
++        double pts = MP_PTS_OR_DEF(dp->pts, dp->dts);
++        if (ts_rollback_should_drop(demux, info, pts, dp->keyframe)) {
++            talloc_free(dp);
++            // *mp_pkt stays NULL; returning true keeps the demux thread going.
++            return true;
++        }
++    }
++
+     if (st->event_flags & AVSTREAM_EVENT_FLAG_METADATA_UPDATED) {
+         st->event_flags = 0;
+         struct mp_tags *tags = talloc_zero(NULL, struct mp_tags);
+@@ -1328,6 +1500,8 @@ static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
+     int64_t seek_pts_av = 0;
+     int seek_stream = -1;
+ 
++    reset_ts_rollback_state(priv);
++
+     if (priv->any_ts_fixed)  {
+         // helpful message to piss of users
+         MP_WARN(demuxer, "Some timestamps returned by the demuxer were linearized. "
