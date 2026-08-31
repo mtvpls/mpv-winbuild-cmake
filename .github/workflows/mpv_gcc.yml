@@ -164,7 +164,7 @@ jobs:
 
       - name: Saving repository cache
         uses: actions/cache/save@main
-        if: false
+        if: always()
         with:
           path: src_packages
           key: ${{ secrets.CACHE_VERSION }}-repository-${{ github.run_id }}
